@@ -95,10 +95,10 @@ struct frame_header {
 };
 
 template<typename HandleType, typename... ArgTypes>
-struct promise_type;
+struct saveable_promise;
 
 template<>
-struct promise_type<void>
+struct saveable_promise<void>
 {
     static frame_header * header_from(void * address) 
     { return reinterpret_cast<frame_header*>(frame_start(address)); }
@@ -117,10 +117,10 @@ template<typename HandleType>
 struct saveable {
     void save(std::ostream & os)
     {
-        frame_header * header = promise_type<void>::header_from(m_address);
+        frame_header * header = saveable_promise<void>::header_from(m_address);
 
         // write out the frame including the size header
-        os.write(reinterpret_cast<char*>(promise_type<void>::frame_start(m_address)), header->size);
+        os.write(reinterpret_cast<char*>(saveable_promise<void>::frame_start(m_address)), header->size);
     }
 
     // destroys the coroutine frame
@@ -138,7 +138,7 @@ struct saveable {
     {  }
 
     template<typename... ArgTypes>
-    saveable(std::coroutine_handle<promise_type<HandleType, ArgTypes...>> h) :
+    saveable(std::coroutine_handle<saveable_promise<HandleType, ArgTypes...>> h) :
         m_address(h.address()), m_handle(h.address())
     { }
 
@@ -148,7 +148,7 @@ struct saveable {
 
 
 template<typename HandleType, typename... ArgTypes>
-struct promise_type : 
+struct saveable_promise : 
     public std::coroutine_traits<HandleType, ArgTypes...>::promise_type 
 {
     static void * operator new(size_t size)
@@ -161,10 +161,10 @@ struct promise_type :
             .size = frame_size,
             .data_size = size,
             .version = saveable_coroutine_version,
-            .hash_code = typeid(promise_type).hash_code(),
+            .hash_code = typeid(saveable_promise).hash_code(),
         };
 
-        std::cerr << "promise_type new(size): " << std::hex << reinterpret_cast<void*>(reinterpret_cast<char*>(mem) + sizeof(frame_header)) << std::endl;
+        std::cerr << "saveable_promise new(size): " << std::hex << reinterpret_cast<void*>(reinterpret_cast<char*>(mem) + sizeof(frame_header)) << std::endl;
         return reinterpret_cast<char*>(mem) + sizeof(frame_header);
     }
 
@@ -176,7 +176,7 @@ struct promise_type :
 
         *reinterpret_cast<frame_header*>(mem) = header;
 
-        std::cerr << "promise_type new(size, header): " << std::hex << reinterpret_cast<void*>(reinterpret_cast<char*>(mem) + sizeof(frame_header)) << std::endl;
+        std::cerr << "saveable_promise new(size, header): " << std::hex << reinterpret_cast<void*>(reinterpret_cast<char*>(mem) + sizeof(frame_header)) << std::endl;
         return reinterpret_cast<char*>(mem) + sizeof(frame_header);
     }
 
@@ -195,10 +195,10 @@ struct promise_type :
         );
     }
 
-    promise_type(ArgTypes&... args) : // connects the upgradeables through the coroutine
+    saveable_promise(ArgTypes&... args) : // connects the upgradeables through the coroutine
         std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
     {
-        void * address = std::coroutine_handle<promise_type>::from_promise(*this).address();
+        void * address = std::coroutine_handle<saveable_promise>::from_promise(*this).address();
 
         int i = 0;
         ( ( m_argument_offset[i++] = (reinterpret_cast<char*>(&args) - reinterpret_cast<char*>(address)) ), ... );
@@ -207,13 +207,13 @@ struct promise_type :
     } 
     
     
-    promise_type(frame_header * header) :        // creates a promise from a saved handle
+    saveable_promise(frame_header * header) :        // creates a promise from a saved handle
         std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
     { 
         std::cerr << "promise_type header constructor" << std::endl;
     }
     
-    promise_type() : 
+    saveable_promise() : 
         std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
     { 
         std::cerr << "promise_type default constructor" << std::endl;
@@ -221,10 +221,10 @@ struct promise_type :
 
     //...
     saveable<HandleType> get_return_object()
-    { return { std::coroutine_handle<promise_type>::from_promise(*this) }; }
+    { return { std::coroutine_handle<saveable_promise>::from_promise(*this) }; }
 
-    ~promise_type()
-    { std::cerr << "promise_type destructor: " << std::hex << std::coroutine_handle<promise_type>::from_promise(*this).address() << std::endl; }
+    ~saveable_promise()
+    { std::cerr << "promise_type destructor: " << std::hex << std::coroutine_handle<saveable_promise>::from_promise(*this).address() << std::endl; }
 
     long m_argument_offset[sizeof...(ArgTypes)];
 };
@@ -232,7 +232,7 @@ struct promise_type :
 template<typename HandleType, typename... ArgTypes>
 saveable<HandleType> load_coro(std::istream & is, ArgTypes const &... args)
 {
-    using promise_type = promise_type<HandleType, ArgTypes...>;
+    using promise_type = saveable_promise<HandleType, ArgTypes...>;
 
     // read in the header
     frame_header header;
@@ -264,7 +264,7 @@ namespace std {
     // promise_type for saveable with arguments to coroutine
     template<typename HandleType, typename... ArgTypes>
     struct coroutine_traits<saveable<HandleType>, ArgTypes...> {
-        using promise_type = promise_type<HandleType, ArgTypes...>;
+        using promise_type = saveable_promise<HandleType, ArgTypes...>;
     };
 }
 
