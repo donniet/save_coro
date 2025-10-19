@@ -92,7 +92,6 @@ struct frame_header {
     size_t offsets;
     version_t version;
     size_t hash_code;
-    long use_count;
 };
 
 template<typename HandleType, typename... ArgTypes>
@@ -126,141 +125,14 @@ struct saveable {
 
     HandleType handle() { return m_handle; }
 
-    size_t use_count() const
-    { return promise_type<void>::header_from(m_address)->use_count; }
-
     saveable(void * address) : 
         m_address(address), m_handle(address) 
-    { 
-        if(m_address == nullptr)
-            return;
-        
-        frame_header * header = promise_type<void>::header_from(m_address);
-        
-        // if we are reference counting, increment the reference
-        if(header->use_count >= 0)
-            header->use_count++;
-    }
+    {  }
 
     template<typename... ArgTypes>
     saveable(std::coroutine_handle<promise_type<HandleType, ArgTypes...>> h) :
         m_address(h.address()), m_handle(h.address())
-    { 
-        frame_header * header = promise_type<void>::header_from(m_address);
-
-        // if we are reference counting, increment the reference
-        if(header->use_count >= 0)
-            header->use_count++;
-    }
-
-    saveable(saveable const & other) : 
-        m_address(other.m_address), m_handle(other.m_handle)
-    { 
-        if(m_address == nullptr)
-            return;
-
-        frame_header * header = promise_type<void>::header_from(m_address);
-        if(header->use_count < 0)
-            return;
-
-        header->use_count++;
-    }
-    saveable(saveable && other) : 
-        m_address(other.m_address), m_handle(other.m_handle)
-    {
-        other.m_address = nullptr;
-        other.m_handle = nullptr;
-    }
-
-    saveable & operator=(saveable const & other)
-    {
-        if(this == &other)
-            return *this;
-        
-        if(m_address != nullptr)
-        {
-            frame_header * header = promise_type<void>::header_from(m_address);
-
-            if(header->use_count > 0)
-                header->use_count--;
-
-            if(header->use_count <= 0)
-            {
-                promise_type<void>::operator delete(m_address);  // clean up
-                std::cerr << "delete in saveable::operator=(const &)" << std::endl;
-            }
-
-            m_address = nullptr;
-            m_handle = nullptr;
-        }
-
-        m_address = other.m_address;
-        m_handle = other.m_handle;
-
-        if(m_address == nullptr)
-            return *this;
-        
-        frame_header * header = promise_type<void>::header_from(m_address);
-        if(header->use_count < 0)
-            return *this; // not reference counted
-
-        header->use_count++;
-        return *this;
-    }
-    saveable & operator=(saveable && other)
-    {
-        if(this == &other)
-            return *this;
-
-        if(m_address == other.m_address)
-        {
-            frame_header * header = promise_type<void>::header_from(m_address);
-            if(header->use_count > 0)
-                header->use_count--;
-
-            other.m_address = nullptr;
-            other.m_handle = nullptr;
-            return *this;
-        }
-
-        frame_header * header = promise_type<void>::header_from(other.m_address);
-        if(header->use_count > 0)
-        {
-            header->use_count--;
-            if(header->use_count == 0)
-            {
-                promise_type<void>::operator delete(other.m_address);
-                std::cerr << "delete in saveable::operator=(&&)" << std::endl;
-            }
-        }
-
-        m_address = other.m_address;
-        m_handle = other.m_handle;
-        other.m_address = nullptr;
-        other.m_handle = nullptr;
-
-        return *this;
-    }
-
-    ~saveable()
-    {
-        if(m_address == nullptr)
-            return;
-        
-        frame_header * header = promise_type<void>::header_from(m_address);
-
-        if(header->use_count < 0)
-            return;
-
-        // if we are reference counting, decrement the reference
-        header->use_count--;
-        if(header->use_count > 0)
-            return;
-
-        // zero reference count, delete the frame
-        std::cerr << "delete in saveable destructor: " << std::hex << m_address << std::endl;
-        // promise_type<void>::operator delete(m_address);
-    }
+    { }
 
     void * m_address;
     HandleType m_handle;
@@ -287,7 +159,6 @@ struct promise_type :
             .offsets = sizeof...(ArgTypes), 
             .version = saveable_coroutine_version,
             .hash_code = typeid(promise_type).hash_code(),
-            .use_count = -1, // not reference counted
         };
 
         std::cerr << "promise_type new(size): " << std::hex << reinterpret_cast<void*>(reinterpret_cast<char*>(mem) + sizeof(frame_header)) << std::endl;
@@ -301,7 +172,6 @@ struct promise_type :
         void * mem = ::operator new(frame_size);
 
         *reinterpret_cast<frame_header*>(mem) = header;
-        reinterpret_cast<frame_header*>(mem)->use_count = 0; // reference count
 
         std::cerr << "promise_type new(size, header): " << std::hex << reinterpret_cast<void*>(reinterpret_cast<char*>(mem) + sizeof(frame_header)) << std::endl;
         return reinterpret_cast<char*>(mem) + sizeof(frame_header);
@@ -340,19 +210,7 @@ struct promise_type :
 
         std::cerr << "promise_type coroutine construtor" << std::endl;
     } 
-    // TODO: we are trying to update the arguments in two places
-    //       but the footer hasn't been loaded yet to make this constructor method work
-    //       we wanted the offsets in the footer because their length is variable
-    //       and we wanted the length to be fixed to allow for loading without
-    //       knowledge of the arguments.
-    //       perhaps we don't need the offsets at all? 
-    promise_type(frame_header * header, ArgTypes const &... args) :        // creates a promise from a saved handle
-        std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
-    {
-        update_arguments(std::make_tuple(args...), std::make_index_sequence<sizeof...(ArgTypes)>{});
-
-        std::cerr << "promise_type load_coro constructor" << std::endl;
-    }
+    
     
     promise_type(frame_header * header) :        // creates a promise from a saved handle
         std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
@@ -364,24 +222,6 @@ struct promise_type :
         std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
     { 
         std::cerr << "promise_type default constructor" << std::endl;
-    }
-
-    template<size_t I>
-    auto & argument()
-    {
-        using argument_type = std::tuple_element_t<I, std::tuple<ArgTypes...>>;
-        void * address = std::coroutine_handle<promise_type>::from_promise(*this).address();
-        frame_footer * footer = footer_from(address);
-        
-        return *reinterpret_cast<argument_type*>(
-            reinterpret_cast<char*>(address) + footer->argument_offset[I]
-        );
-    }
-
-    template<typename ArgTuple, size_t ... Is>
-    void update_arguments(ArgTuple const & argument_tuple, std::index_sequence<Is...>)
-    {
-        ( ( argument<Is>() = get<Is>(argument_tuple) ), ... );
     }
 
     //...
