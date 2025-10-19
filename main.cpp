@@ -185,7 +185,10 @@ struct saveable {
                 header->use_count--;
 
             if(header->use_count <= 0)
+            {
                 promise_type<void>::operator delete(m_address);  // clean up
+                std::cerr << "delete in saveable::operator=(const &)" << std::endl;
+            }
 
             m_address = nullptr;
             m_handle = nullptr;
@@ -225,7 +228,10 @@ struct saveable {
         {
             header->use_count--;
             if(header->use_count == 0)
+            {
                 promise_type<void>::operator delete(other.m_address);
+                std::cerr << "delete in saveable::operator=(&&)" << std::endl;
+            }
         }
 
         m_address = other.m_address;
@@ -252,7 +258,8 @@ struct saveable {
             return;
 
         // zero reference count, delete the frame
-        promise_type<void>::operator delete(m_address);
+        std::cerr << "delete in saveable destructor: " << std::hex << m_address << std::endl;
+        // promise_type<void>::operator delete(m_address);
     }
 
     void * m_address;
@@ -283,6 +290,7 @@ struct promise_type :
             .use_count = -1, // not reference counted
         };
 
+        std::cerr << "promise_type new(size): " << std::hex << reinterpret_cast<void*>(reinterpret_cast<char*>(mem) + sizeof(frame_header)) << std::endl;
         return reinterpret_cast<char*>(mem) + sizeof(frame_header);
     }
 
@@ -294,6 +302,8 @@ struct promise_type :
 
         *reinterpret_cast<frame_header*>(mem) = header;
         reinterpret_cast<frame_header*>(mem)->use_count = 0; // reference count
+
+        std::cerr << "promise_type new(size, header): " << std::hex << reinterpret_cast<void*>(reinterpret_cast<char*>(mem) + sizeof(frame_header)) << std::endl;
         return reinterpret_cast<char*>(mem) + sizeof(frame_header);
     }
 
@@ -301,6 +311,8 @@ struct promise_type :
     {
         void * mem = reinterpret_cast<char*>(addr) - sizeof(frame_header);
         ::operator delete(mem);
+
+        std::cerr << "promise_type delete: " << std::hex << addr << std::endl;
     }
 
     static frame_header * header_from(void * address) 
@@ -328,7 +340,12 @@ struct promise_type :
 
         std::cerr << "promise_type coroutine construtor" << std::endl;
     } 
-
+    // TODO: we are trying to update the arguments in two places
+    //       but the footer hasn't been loaded yet to make this constructor method work
+    //       we wanted the offsets in the footer because their length is variable
+    //       and we wanted the length to be fixed to allow for loading without
+    //       knowledge of the arguments.
+    //       perhaps we don't need the offsets at all? 
     promise_type(frame_header * header, ArgTypes const &... args) :        // creates a promise from a saved handle
         std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
     {
@@ -336,7 +353,13 @@ struct promise_type :
 
         std::cerr << "promise_type load_coro constructor" << std::endl;
     }
-
+    
+    promise_type(frame_header * header) :        // creates a promise from a saved handle
+        std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
+    { 
+        std::cerr << "promise_type header constructor" << std::endl;
+    }
+    
     promise_type() : 
         std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
     { 
@@ -366,7 +389,7 @@ struct promise_type :
     { return { std::coroutine_handle<promise_type>::from_promise(*this) }; }
 
     ~promise_type()
-    { std::cerr << "promise_type destructor" << std::endl; }
+    { std::cerr << "promise_type destructor: " << std::hex << std::coroutine_handle<promise_type>::from_promise(*this).address() << std::endl; }
 
 };
 
@@ -387,7 +410,7 @@ saveable<HandleType> load_coro(std::istream & is, ArgTypes const &... args)
         throw std::logic_error("hash_code mismatch");
     
     // allocate the memory for the frame using the dedicated allocator
-    void * address = new(header) promise_type(&header, args...);
+    void * address = new(header) promise_type(&header); //, args...);
 
     // read in the rest of the frame into allocated memory
     is.read(reinterpret_cast<char*>(address), header.data_size);
@@ -432,11 +455,11 @@ int main(int ac, char * av[])
     auto coro2 = load_coro<lazy<int>>(ifs, &y);
     ifs.close();
 
+    coro2.handle().resume();
+    std::cerr << "updated value: " << std::dec << coro2.handle().get() << std::endl;
+
     coro.handle().resume();
     std::cerr << "original value: " << coro.handle().get() << std::endl;
-
-    coro2.handle().resume();
-    std::cerr << "updated value: " << coro2.handle().get() << std::endl;
 
     return 0;
 }
