@@ -3,6 +3,7 @@
 #include <iostream>
 #include <generator>
 #include <fstream>
+#include <sstream>
 
 
 using version_t = unsigned long;
@@ -89,7 +90,6 @@ using lazy = no_yield_coroutine<T, std::suspend_always>;
 struct frame_header {
     size_t size;
     size_t data_size;
-    size_t offsets;
     version_t version;
     size_t hash_code;
 };
@@ -123,6 +123,14 @@ struct saveable {
         os.write(reinterpret_cast<char*>(promise_type<void>::frame_start(m_address)), header->size);
     }
 
+    // destroys the coroutine frame
+    void destroy()
+    {   
+        std::coroutine_handle<>::from_address(m_address).destroy();
+        m_address = nullptr;
+        m_handle = nullptr;
+    }
+
     HandleType handle() { return m_handle; }
 
     saveable(void * address) : 
@@ -143,20 +151,15 @@ template<typename HandleType, typename... ArgTypes>
 struct promise_type : 
     public std::coroutine_traits<HandleType, ArgTypes...>::promise_type 
 {
-    struct frame_footer {
-        long argument_offset[sizeof...(ArgTypes)];
-    };
-
     static void * operator new(size_t size)
     {
-        //                  | header             | data | footer              |
-        size_t frame_size = sizeof(frame_header) + size + sizeof(frame_footer);
+        //                  | header             | data 
+        size_t frame_size = sizeof(frame_header) + size;
         void * mem = ::operator new(frame_size);
 
         *reinterpret_cast<frame_header*>(mem) = {
             .size = frame_size,
             .data_size = size,
-            .offsets = sizeof...(ArgTypes), 
             .version = saveable_coroutine_version,
             .hash_code = typeid(promise_type).hash_code(),
         };
@@ -167,8 +170,8 @@ struct promise_type :
 
     static void * operator new(size_t size, frame_header const & header)
     {
-        //                  | header             | data | footer              |
-        size_t frame_size = sizeof(frame_header) + header.data_size + sizeof(frame_footer);
+        //                  | header             | data 
+        size_t frame_size = sizeof(frame_header) + header.data_size;
         void * mem = ::operator new(frame_size);
 
         *reinterpret_cast<frame_header*>(mem) = header;
@@ -192,21 +195,13 @@ struct promise_type :
         );
     }
 
-    static frame_footer * footer_from(void * address)
-    {
-        return reinterpret_cast<frame_footer*>(
-            reinterpret_cast<char*>(address) + header_from(address)->data_size
-        );
-    }
-
     promise_type(ArgTypes&... args) : // connects the upgradeables through the coroutine
         std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
     {
         void * address = std::coroutine_handle<promise_type>::from_promise(*this).address();
-        frame_footer * footer = footer_from(address);
 
         int i = 0;
-        ( ( footer->argument_offset[i++] = (reinterpret_cast<char*>(&args) - reinterpret_cast<char*>(address)) ), ... );
+        ( ( m_argument_offset[i++] = (reinterpret_cast<char*>(&args) - reinterpret_cast<char*>(address)) ), ... );
 
         std::cerr << "promise_type coroutine construtor" << std::endl;
     } 
@@ -231,6 +226,7 @@ struct promise_type :
     ~promise_type()
     { std::cerr << "promise_type destructor: " << std::hex << std::coroutine_handle<promise_type>::from_promise(*this).address() << std::endl; }
 
+    long m_argument_offset[sizeof...(ArgTypes)];
 };
 
 template<typename HandleType, typename... ArgTypes>
@@ -250,18 +246,16 @@ saveable<HandleType> load_coro(std::istream & is, ArgTypes const &... args)
         throw std::logic_error("hash_code mismatch");
     
     // allocate the memory for the frame using the dedicated allocator
-    void * address = new(header) promise_type(&header); //, args...);
+    void * address = promise_type::operator new(header.data_size, header); //, args...);
 
     // read in the rest of the frame into allocated memory
     is.read(reinterpret_cast<char*>(address), header.data_size);
 
-    // read in the footer
-    typename promise_type::frame_footer footer;
-    is.read(reinterpret_cast<char*>(&footer), sizeof(footer));
+    promise_type & promise = std::coroutine_handle<promise_type>::from_address(address).promise();
 
     // copy the arguments to the frame using the offsets
     int i = 0;
-    ( ( *reinterpret_cast<ArgTypes*>(reinterpret_cast<char*>(address) + footer.argument_offset[i++]) = args ), ... );
+    ( ( *reinterpret_cast<ArgTypes*>(reinterpret_cast<char*>(address) + promise.m_argument_offset[i++]) = args ), ... );
 
     return { address };
 }
@@ -276,7 +270,7 @@ namespace std {
 
 saveable<lazy<int>> run(int * x)
 {
-    co_return *x;
+    co_return *x + 5;
 }
  
 
@@ -291,15 +285,19 @@ int main(int ac, char * av[])
     coro.save(ofs);
     ofs.close();
 
+    coro.destroy();
+
     std::ifstream ifs("saved.coro");
     auto coro2 = load_coro<lazy<int>>(ifs, &y);
     ifs.close();
 
+
     coro2.handle().resume();
     std::cerr << "updated value: " << std::dec << coro2.handle().get() << std::endl;
 
-    coro.handle().resume();
-    std::cerr << "original value: " << coro.handle().get() << std::endl;
+    // coro.handle().resume();
+    // std::cerr << "original value: " << coro.handle().get() << std::endl;
+
 
     return 0;
 }
