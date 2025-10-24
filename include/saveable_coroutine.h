@@ -16,6 +16,11 @@ struct frame_header {
     size_t data_size;
     version_t version;
     size_t hash_code;
+
+    union {
+        void * child_address;
+        size_t frame_count;
+    };
 };
 
 template<typename HandleType, typename... ArgTypes>
@@ -35,17 +40,73 @@ struct saveable_promise<void>
         void * mem = reinterpret_cast<char*>(addr) - sizeof(frame_header);
         ::operator delete(mem);
     }
+
+    static void * operator new(size_t size, frame_header const & header)
+    {
+        //                  | header             | data 
+        size_t frame_size = sizeof(frame_header) + header.data_size;
+        void * mem = ::operator new(frame_size);
+
+        *reinterpret_cast<frame_header*>(mem) = header;
+
+        std::cerr << "saveable_promise new(size, header): " << std::hex << reinterpret_cast<void*>(reinterpret_cast<char*>(mem) + sizeof(frame_header)) << std::endl;
+        return reinterpret_cast<char*>(mem) + sizeof(frame_header);
+    }
+};
+
+struct saveable_base
+{
+    frame_header * get_header()
+    { return saveable_promise<void>::header_from(m_address); }
+
+    void save(std::ostream & os)
+    {
+        size_t frame_count = 1;
+        frame_header * header = get_header();
+
+        for(frame_header * h = header; h->child_address != nullptr; ++frame_count)
+            h = saveable_promise<void>::header_from(h->child_address);
+
+        // first write out the number of frames
+        os.write(reinterpret_cast<char*>(&frame_count), sizeof(size_t));
+
+        frame_header wh;
+        
+        // the write out all the frames
+        for(void * addr = m_address; ;)
+        {
+            wh = *header;
+            wh.child_address = nullptr;
+
+            // write out the header
+            os.write(reinterpret_cast<char*>(&wh), sizeof(frame_header));
+            
+            // write out the data
+            os.write(reinterpret_cast<char*>(addr), header->data_size);
+
+            addr = header->child_address;
+            if(addr == nullptr)
+                break;
+
+            header = saveable_promise<void>::header_from(header->child_address);
+        }
+    }
+
+    saveable_base(void * address) : m_address{address} { }
+
+    void * address() const 
+    { return m_address; }
+
+    void * m_address;
 };
 
 template<typename HandleType>
-struct saveable {
-    void save(std::ostream & os)
-    {
-        frame_header * header = saveable_promise<void>::header_from(m_address);
+struct saveable;
 
-        // write out the frame including the size header
-        os.write(reinterpret_cast<char*>(saveable_promise<void>::frame_start(m_address)), header->size);
-    }
+template<typename HandleType>
+struct saveable : public saveable_base {
+    using wrapped_promise_type = std::coroutine_traits<HandleType>::promise_type;
+    using wrapped_cohandle_type = std::coroutine_handle<wrapped_promise_type>;
 
     // destroys the coroutine frame
     void destroy()
@@ -57,18 +118,32 @@ struct saveable {
 
     HandleType handle() { return m_handle; }
 
+
+    // how to handle the operator co_await() 
+    bool await_ready() { return m_handle.await_ready(); }
+
+    template<typename HandleType2>
+    auto await_suspend(HandleType2 handle) 
+    { return m_handle.await_suspend(handle); }
+
+    auto await_resume()
+    { return m_handle.await_resume(); }
+
     saveable(void * address) : 
-        m_address(address), m_handle(address) 
+        saveable_base{address}, 
+        m_handle{wrapped_cohandle_type::from_address(address)}
     {  }
 
+
     template<typename... ArgTypes>
-    saveable(std::coroutine_handle<saveable_promise<HandleType, ArgTypes...>> h) :
-        m_address(h.address()), m_handle(h.address())
+    saveable(std::coroutine_handle<saveable_promise<HandleType, ArgTypes...>> h, 
+             HandleType const & handle) :
+        saveable_base{h.address()}, m_handle{handle}
     { }
 
-    void * m_address;
     HandleType m_handle;
 };
+
 
 
 template<typename HandleType, typename... ArgTypes>
@@ -86,21 +161,10 @@ struct saveable_promise :
             .data_size = size,
             .version = saveable_coroutine_version,
             .hash_code = typeid(saveable_promise).hash_code(),
+            .child_address = nullptr,
         };
 
         std::cerr << "saveable_promise new(size): " << std::hex << reinterpret_cast<void*>(reinterpret_cast<char*>(mem) + sizeof(frame_header)) << std::endl;
-        return reinterpret_cast<char*>(mem) + sizeof(frame_header);
-    }
-
-    static void * operator new(size_t size, frame_header const & header)
-    {
-        //                  | header             | data 
-        size_t frame_size = sizeof(frame_header) + header.data_size;
-        void * mem = ::operator new(frame_size);
-
-        *reinterpret_cast<frame_header*>(mem) = header;
-
-        std::cerr << "saveable_promise new(size, header): " << std::hex << reinterpret_cast<void*>(reinterpret_cast<char*>(mem) + sizeof(frame_header)) << std::endl;
         return reinterpret_cast<char*>(mem) + sizeof(frame_header);
     }
 
@@ -117,6 +181,20 @@ struct saveable_promise :
         return reinterpret_cast<frame_header*>(
             reinterpret_cast<char*>(address) - sizeof(frame_header)
         );
+    }
+
+    template<typename HandleType2>
+    auto await_transform(saveable<HandleType2> child_handle) 
+    {
+        auto cohandle = 
+            std::coroutine_handle<saveable_promise<HandleType, ArgTypes...>>::from_promise(*this);
+
+        void * address = cohandle.address();
+        frame_header * header = header_from(address);
+
+        header->child_address = child_handle.address();
+
+        return child_handle;
     }
 
     saveable_promise(ArgTypes&... args) : // connects the upgradeables through the coroutine
@@ -145,7 +223,10 @@ struct saveable_promise :
 
     //...
     saveable<HandleType> get_return_object()
-    { return { std::coroutine_handle<saveable_promise>::from_promise(*this) }; }
+    { return { 
+        std::coroutine_handle<saveable_promise>::from_promise(*this),
+        std::coroutine_traits<HandleType, ArgTypes...>::promise_type::get_return_object(),
+    }; }
 
     ~saveable_promise()
     { std::cerr << "promise_type destructor: " << std::hex << std::coroutine_handle<saveable_promise>::from_promise(*this).address() << std::endl; }
@@ -158,30 +239,64 @@ saveable<HandleType> load_coro(std::istream & is, ArgTypes const &... args)
 {
     using promise_type = saveable_promise<HandleType, ArgTypes...>;
 
-    // read in the header
+    // first read in the number of frames
+    size_t frame_count;
+    is.read(reinterpret_cast<char*>(&frame_count), sizeof(size_t));
+
+    frame_header * prev_header = nullptr;
+    void * return_address = nullptr;
     frame_header header;
-    is.read(reinterpret_cast<char*>(&header), sizeof(frame_header));
 
-    // check the version and hash code
-    if(header.version != saveable_coroutine_version)
-        throw std::logic_error("version mismatch");
+    for(; frame_count > 0; --frame_count)
+    {
+        // read in the header
+        is.read(reinterpret_cast<char*>(&header), sizeof(frame_header));
 
-    if(header.hash_code != typeid(promise_type).hash_code())
-        throw std::logic_error("hash_code mismatch");
-    
-    // allocate the memory for the frame using the dedicated allocator
-    void * address = promise_type::operator new(header.data_size, header); //, args...);
+        // if this is the first header, check the version and hash
+        if(return_address == nullptr) 
+        {
+            // check the version and hash code
+            if(header.version != saveable_coroutine_version)
+                throw std::logic_error("version mismatch");
 
-    // read in the rest of the frame into allocated memory
-    is.read(reinterpret_cast<char*>(address), header.data_size);
+            if(header.hash_code != typeid(promise_type).hash_code())
+                throw std::logic_error("hash_code mismatch");
+        }
+        
+        // allocate the memory for the frame using the dedicated allocator
+        void * address = 
+            saveable_promise<void>::operator new(header.data_size, header); //, args...);
 
-    promise_type & promise = std::coroutine_handle<promise_type>::from_address(address).promise();
+        // read in the rest of the frame into allocated memory
+        is.read(reinterpret_cast<char*>(address), header.data_size);
 
-    // copy the arguments to the frame using the offsets
-    int i = 0;
-    ( ( *reinterpret_cast<ArgTypes*>(reinterpret_cast<char*>(address) + promise.m_argument_offset[i++]) = args ), ... );
+        // if this is the first header update the args
+        if(return_address == nullptr)
+        {
+            auto cohandle = 
+                std::coroutine_handle<promise_type>::from_address(address);
 
-    return { address };
+            promise_type & promise = cohandle.promise();
+
+            // copy the arguments to the frame using the offsets
+            int i = 0;
+            char * caddress = reinterpret_cast<char*>(address);
+
+            ( ( *reinterpret_cast<ArgTypes*>(
+                caddress + promise.m_argument_offset[i++]) = args ), ... );
+
+            return_address = address;
+        }
+        // otherwise set the previous frame's child pointer
+        else
+        {
+            prev_header->child_address = address;
+        }
+
+        prev_header = saveable_promise<void>::header_from(address);
+    }
+
+    return { return_address };
 }
 
 namespace std {
