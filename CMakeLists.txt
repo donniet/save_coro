@@ -11,3 +11,5 @@ include_directories(include)
 
 add_executable(save_coro main.cpp)
 
+add_executable(test_coro1 test_coro1.cpp)
+
