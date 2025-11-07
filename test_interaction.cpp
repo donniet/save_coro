@@ -1,5 +1,5 @@
-#include "generator.h"
-#include "task.h"
+#include "generator.hpp"
+#include "task.hpp"
 #include "ranges.hpp"
 #include "list.hpp"
 #include "ring.hpp"

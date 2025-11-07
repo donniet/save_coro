@@ -2,7 +2,7 @@
 #define __GAME_HPP__
 
 #include "ranges.hpp"
-#include "task.h"
+#include "task.hpp"
 
 #include <stdexcept>
 #include <thread>
