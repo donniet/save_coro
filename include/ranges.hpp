@@ -84,9 +84,9 @@ public:
     const_iterator begin() const { return ranges_.begin(); }
     const_iterator end() const { return ranges_.end(); }
 
-    const_value_iterator values_begin() const
+    const_value_iterator value_begin() const
     { return const_value_iterator{ranges_.begin(), ranges_.end()}; }
-    std::default_sentinel_t values_end() const 
+    std::default_sentinel_t value_end() const 
     { return {}; }
 
     size_t size() const { return ranges_.size(); }
@@ -220,7 +220,7 @@ class ranges_values_view :
 public:
     ranges_values_view() = default;
     ranges_values_view(Ranges<T> const& ranges) :
-        begin_{ranges.values_begin()}
+        begin_{ranges.value_begin()}
     { }
 
     auto begin() const { return begin_; }

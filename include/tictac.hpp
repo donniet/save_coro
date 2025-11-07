@@ -70,6 +70,11 @@ public:
     // standard game interface
     auto operator()(Move m) { return play(m); }
     operator bool() const   { return !done(); }
+    // used for storing state in sorted containers
+    bool operator==(TicTac const& other) const 
+    { return m_board == other.m_board; }
+    bool operator<(TicTac const& other) const
+    { return m_board < other.m_board; }
 
     bool done() const
     { return winner() != Blank; }
@@ -87,6 +92,9 @@ public:
     Ranges<action_type> actions() const
     { 
         Ranges<action_type> ret;
+
+        if(winner() != Blank)
+            return ret;
 
         int range_start = -1; // not started
         for(int m = 0; m < 9; m++)
@@ -112,6 +120,12 @@ public:
 
     std::array<Mark, TotalMoves> m_board;
 };
+
+TicTac::Move & operator++(TicTac::Move & move) 
+{ 
+    move = static_cast<TicTac::Move>((int)move + 1);
+    return move; 
+}
 
 std::ostream& operator<<(std::ostream& os, TicTac::action_type const& act)
 {
@@ -150,9 +164,18 @@ std::ostream& operator<<(std::ostream& os, TicTac const& board)
     for(int i = 0; i < 3; i++)
     {
         for(int j = 0; j < 3; j++)
+        {
             os << board.at((TicTac::Move)(3 * i + j));
+            if(j < 2) 
+                os << "|";
+        }
+
+        if(i < 2)
+            os << "\n-----";
+
         os << "\n";
     }
+    os << "turn: " << board.turn() << "\n";
 
     return os;
 }

@@ -27,21 +27,31 @@ struct game_traits
 };
 
 template<typename State>
+struct GameInterface;
+
+template<typename State>
 class PlayerInterface { 
 public:
+    friend struct GameInterface<State>;
+
     using action_type = game_traits<State>::action_type;
 
     size_t id() const { return m_id; }
     operator size_t() const { return m_id; }
 
-    PlayerInterface() : m_id(0) { }
-    explicit PlayerInterface(size_t id) : m_id(id) { }
+    PlayerInterface() : m_id(0), m_game{nullptr} { }
+    explicit PlayerInterface(size_t id) : m_id(id), m_game{nullptr} { }
 
     virtual task<void> display(State const&) = 0;
     virtual task<action_type> select(Ranges<action_type> const&) = 0;
 
+protected:
+    GameInterface<State> *& game_ptr() { return m_game; }
+    GameInterface<State> * const& game_ptr() const { return m_game; }
+
 private:
     size_t m_id;
+    GameInterface<State> * m_game;
 };
 
 template<typename State>
@@ -52,10 +62,20 @@ struct GameInterface {
     virtual task<List<player_type*>> players() 
     { co_return m_players; }
 
-    virtual task<void> display(State const& state) = 0;
+    virtual task<void> display(State const& state) 
+    {
+        for(auto const& p : m_players)
+            co_await p->display(state);
+    }
 
     void add_player(player_type & player)
-    { m_players.push_back(&player); }
+    { 
+        if(player.game_ptr() != nullptr)
+            throw std::logic_error("player already part of a game.");
+
+        player.game_ptr() = this;
+        m_players.push_back(&player); 
+    }
 
     auto players_begin() const
     { return m_players.begin(); }
@@ -65,6 +85,9 @@ struct GameInterface {
 
     auto players_view() const
     { return std::ranges::views::all(m_players); }
+
+    size_t players_size() const
+    { return m_players.size(); }
 
     GameInterface() : m_players{} { }
 private:
@@ -93,7 +116,8 @@ struct ThreadedGame : public GameInterface<State>
         {
             ++player_count;
 
-            add_work([&]() {
+            add_work([player, &state, &local_lock, &local_cond, &player_count]() 
+            {
                 auto task = player->display(state);
                 task.get(); // this is a coroutine
 
