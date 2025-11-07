@@ -26,6 +26,26 @@ struct frame_header {
 template<typename HandleType, typename... ArgTypes>
 struct saveable_promise;
 
+// template<typename Awaitable>
+// struct awaitable_reference
+// {
+//     Awaitable * m_awaitable;
+
+//     auto await_ready() const 
+//     { return m_awaitable->await_ready(); }
+
+//     template<typename Promise>
+//     auto await_suspend(std::coroutine_handle<Promise> handle)
+//     { return m_awaitable->await_suspend(handle); }
+
+//     auto await_resume() const
+//     { return m_awaitable->await_resume(); }
+
+//     awaitable_reference(Awaitable & awaitable) :
+//         m_awaitable(&awaitable)
+//     { }
+// };
+
 template<>
 struct saveable_promise<void>
 {
@@ -73,10 +93,11 @@ struct saveable_base
         frame_header wh;
         
         // the write out all the frames
-        for(void * addr = m_address; ;)
+        for(void * addr = m_address; ; --frame_count)
         {
             wh = *header;
-            wh.child_address = nullptr;
+            // wh.child_address = nullptr;
+            wh.frame_count = frame_count;
 
             // write out the header
             os.write(reinterpret_cast<char*>(&wh), sizeof(frame_header));
@@ -145,11 +166,21 @@ struct saveable : public saveable_base {
 };
 
 
+struct suspend_aware
+{
+    virtual void set_handle(std::coroutine_handle<>) = 0;
+};
 
 template<typename HandleType, typename... ArgTypes>
 struct saveable_promise : 
     public std::coroutine_traits<HandleType, ArgTypes...>::promise_type 
 {
+    template<size_t I>
+    struct argument_traits
+    {
+        using type = std::tuple_element_t<I, std::tuple<ArgTypes...>>;
+    };
+
     static void * operator new(size_t size)
     {
         //                  | header             | data 
@@ -197,8 +228,83 @@ struct saveable_promise :
         return child_handle;
     }
 
+    template<size_t I>
+    void hydrate_argument(argument_traits<I>::type * arg)
+    {
+        auto cohandle = std::coroutine_handle<saveable_promise>::from_promise(*this);
+        void * address = cohandle.address();
+
+        // does this argument refer to any coroutine handles?
+        // if so replace it with the approprate handle to the hydrated coroutine
+
+        auto parg = reinterpret_cast<argument_traits<I>::type*>(
+            reinterpret_cast<char*>(address) + m_argument_offset[I]);
+
+        if constexpr(std::is_base_of<suspend_aware, typename argument_traits<I>::type>::value)
+        {
+            if(m_suspended)
+                dynamic_cast<suspend_aware*>(arg)->set_handle(cohandle);
+            else
+                dynamic_cast<suspend_aware*>(arg)->set_handle(nullptr);
+        }
+
+        *parg = *arg;
+    }
+
+
+    void hydrate_arguments(ArgTypes & ... args)
+    { hydrate_arguments(std::make_tuple<ArgTypes*...>(&args...), std::make_index_sequence<sizeof...(ArgTypes)>{}); }
+
+    template<size_t ... Is>
+    void hydrate_arguments(std::tuple<ArgTypes*...> args, std::index_sequence<Is...>)
+    {
+        ( hydrate_argument<Is>(std::get<Is>(args)), ... );
+    }
+
+    // we need a way to keep track of what this routine is waiting for
+    // 
+    template<typename Awaitable>
+    struct waiting_on {
+        bool await_ready()
+        { return m_awaitable.await_ready(); }
+    
+        auto await_suspend(std::coroutine_handle<saveable_promise<HandleType, ArgTypes...>> handle)
+        {
+            // here we can monitor if the coroutine is suspended
+            // and the handle that we are suspended on
+
+            // after hydration we can replace this handle in a 
+            // hydration aware argument
+            auto & promise = handle.promise();
+            promise.m_suspended = true;
+            m_handle = handle;
+            return m_awaitable.await_suspend(handle);
+        }
+
+        auto await_resume()
+        { 
+            // here we can clear the state of awaiting 
+            auto & promise = m_handle.promise();
+            promise.m_suspended = false;
+            m_handle = nullptr;
+            return m_awaitable.await_resume(); 
+        }
+
+        Awaitable m_awaitable;
+        std::coroutine_handle<saveable_promise<HandleType, ArgTypes...>> m_handle;
+    };
+
+    // return non-savables directly
+    // TODO: create concept for awaitables that are not saveable
+    template<typename Awaitable>
+    auto await_transform(Awaitable & awaitable)
+    // { return awaitable_reference<Awaitable>(awaitable); }
+    // { return awaitable.operator co_await(); }
+    { return waiting_on{awaitable, nullptr}; }
+
     saveable_promise(ArgTypes&... args) : // connects the upgradeables through the coroutine
-        std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
+        std::coroutine_traits<HandleType, ArgTypes...>::promise_type{},
+        m_suspended{false}
     {
         void * address = std::coroutine_handle<saveable_promise>::from_promise(*this).address();
 
@@ -210,13 +316,15 @@ struct saveable_promise :
     
     
     saveable_promise(frame_header * header) :        // creates a promise from a saved handle
-        std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
+        std::coroutine_traits<HandleType, ArgTypes...>::promise_type{},
+        m_suspended{false}
     { 
         std::cerr << "promise_type header constructor" << std::endl;
     }
     
     saveable_promise() : 
-        std::coroutine_traits<HandleType, ArgTypes...>::promise_type{}
+        std::coroutine_traits<HandleType, ArgTypes...>::promise_type{},
+        m_suspended{false}
     { 
         std::cerr << "promise_type default constructor" << std::endl;
     }
@@ -232,10 +340,11 @@ struct saveable_promise :
     { std::cerr << "promise_type destructor: " << std::hex << std::coroutine_handle<saveable_promise>::from_promise(*this).address() << std::endl; }
 
     long m_argument_offset[sizeof...(ArgTypes)];
+    bool m_suspended;
 };
 
 template<typename HandleType, typename... ArgTypes>
-saveable<HandleType> load_coro(std::istream & is, ArgTypes const &... args)
+saveable<HandleType> load_coro(std::istream & is, ArgTypes  &... args)
 {
     using promise_type = saveable_promise<HandleType, ArgTypes...>;
 
@@ -278,12 +387,7 @@ saveable<HandleType> load_coro(std::istream & is, ArgTypes const &... args)
 
             promise_type & promise = cohandle.promise();
 
-            // copy the arguments to the frame using the offsets
-            int i = 0;
-            char * caddress = reinterpret_cast<char*>(address);
-
-            ( ( *reinterpret_cast<ArgTypes*>(
-                caddress + promise.m_argument_offset[i++]) = args ), ... );
+            promise.hydrate_arguments(args...);
 
             return_address = address;
         }

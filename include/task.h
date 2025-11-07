@@ -4,8 +4,6 @@
 #include <coroutine>
 #include <variant>
 #include <stdexcept>
-#include <future>
-#include <iostream>
 
 template<typename T>
 class task {
@@ -47,8 +45,11 @@ public:
     ~task();
     task& operator=(task&& t) noexcept;
 
-    bool done();
-    T get();
+    operator bool() const noexcept; // !done()
+    T operator ()() const;          // get()
+
+    bool done() const noexcept;
+    T get() const;
 
     struct awaiter {
         explicit awaiter(std::coroutine_handle<promise_type> h) noexcept;
@@ -68,17 +69,132 @@ private:
     std::coroutine_handle<promise_type> coro_;
 };
 
+template<>
+class task<void> {
+public:
+    struct awaiter;
+
+    class promise_type {
+    public:
+        promise_type() noexcept : continuation_{}, result_{} {}
+        ~promise_type() {}
+
+        struct final_awaiter {
+            bool await_ready() const noexcept { return false; }
+            std::coroutine_handle<> await_suspend(
+                std::coroutine_handle<promise_type> h) const noexcept
+            {
+                if(h.promise().continuation_)
+                    return h.promise().continuation_;
+
+                return std::noop_coroutine();
+            }
+            void await_resume() const noexcept { }
+        };
+
+        // how can we extract the return value via the task returned here?
+        task get_return_object() noexcept
+        { return task{
+            std::coroutine_handle<promise_type>::from_promise(*this)}; }
+        std::suspend_always initial_suspend() const noexcept
+        { return {}; }
+        final_awaiter final_suspend() const noexcept
+        { return {}; }
+        void unhandled_exception() noexcept
+        { result_ = std::current_exception(); }
+        void return_void() noexcept { }
+
+        // int get();
+
+    private:
+        friend task;
+        friend task::awaiter;
+        friend final_awaiter;
+
+        std::coroutine_handle<> continuation_;
+        std::variant<std::monostate, std::exception_ptr> result_;
+    };
+
+    task(task&& t) noexcept : coro_{t.coro_}
+    { t.coro_ = nullptr; }
+    ~task() { coro_.destroy(); }
+    task& operator=(task&& t) noexcept
+    { 
+        if(this == &t)
+            return *this;
+        coro_ = t.coro_;
+        t.coro_ = nullptr;
+        return *this;
+    }
+
+    operator bool() const noexcept { return !done(); }
+    void operator ()() const { get(); }
+
+    bool done() const noexcept { return coro_.done(); }
+    void get() const { coro_.resume(); }
+
+    struct awaiter {
+        explicit awaiter(std::coroutine_handle<promise_type> h) noexcept :
+            coro_{h} { }
+        bool await_ready() noexcept
+        { return !std::holds_alternative<std::monostate>(
+            coro_.promise().result_); }
+        std::coroutine_handle<promise_type> await_suspend(
+            std::coroutine_handle<> h) noexcept
+        { 
+            coro_.promise().continuation_ = h; 
+            return coro_;
+        }
+        void await_resume() 
+        {
+            using std::holds_alternative, std::exception_ptr, 
+                  std::rethrow_exception;
+            auto& p = coro_.promise();
+
+            if(holds_alternative<exception_ptr>(p.result_))
+                rethrow_exception(std::get<exception_ptr>(p.result_));
+        }
+    private:
+        std::coroutine_handle<promise_type> coro_;
+    };
+
+    awaiter operator co_await() && noexcept
+    { return awaiter{coro_}; }
+
+private:
+    explicit task(std::coroutine_handle<promise_type> h) noexcept :
+        coro_{h} { }
+
+    std::coroutine_handle<promise_type> coro_;
+};
+
+namespace std
+{
+    template<typename T, typename... ArgTypes>
+    struct coroutine_traits<task<T>, ArgTypes...>
+    { using promise_type = task<T>::promise_type; };
+} // std
+
 /**
  * task implementation
  */
 template<typename T>
-bool task<T>::done() 
+bool task<T>::done() const noexcept
 { return coro_.done(); }
+
+template<typename T>
+task<T>::operator bool() const noexcept
+{ return !done(); }
+
+template<typename T>
+T task<T>::operator()() const
+{ return get(); }
+
 
 // if using the task outside of a coroutine, this method
 // will retrieve the value
 template<typename T>
-T task<T>::get()
+T task<T>::get() const
 {
     using std::holds_alternative, std::exception_ptr,
         std::rethrow_exception;
@@ -168,8 +284,7 @@ T task<T>::awaiter::await_resume()
 
 
 /***
-
-template<typename T>* task<T>::promise_type implementation
+ * task<T>::promise_type implementation
  */
 template<typename T>
 task<T>::promise_type::promise_type() noexcept : 
@@ -210,8 +325,7 @@ task<T>::promise_type::final_awaiter task<T>::promise_type::final_suspend() noex
 
 
 /***
-
-template<typename T>* task<T>::promise_type::final_awaiter implementation
+ * task<T>::promise_type::final_awaiter implementation
  */
 template<typename T>
 bool task<T>::promise_type::final_awaiter::await_ready() noexcept
